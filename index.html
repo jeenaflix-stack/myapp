@@ -553,11 +553,71 @@ body.search-active .search-backdrop{opacity:1;pointer-events:auto}
 const XTREAM = {
   server: "filex.asia:8080",
   port: 80,
-  user: "6754299551",
+  user: "farukh121",
   pass: "4577423996",
 };
-const API_BASE = `http://${XTREAM.server}/player_api.php?username=${XTREAM.user}&password=${XTREAM.pass}`;
-const STREAM_BASE = `http://${XTREAM.server}`;
+const DIRECT_HOST = `http://${XTREAM.server}`;
+const GATEWAY_HOST = "https://project--6d62bd45-a830-4359-bd93-ee71a1252200.lovable.app/api/public/iptv";
+
+function uniqueHosts(hosts){
+  return hosts.filter((h,i,a)=>h && a.indexOf(h)===i);
+}
+function sameAppGateway(){
+  const h = location.hostname;
+  return h === "localhost" || h === "127.0.0.1" || h.endsWith(".netlify.app") || h.endsWith(".netlify.live") || h.endsWith(".lovable.app");
+}
+function gatewayHosts(){
+  if(location.protocol === "file:") return uniqueHosts([DIRECT_HOST, GATEWAY_HOST]);
+  if(sameAppGateway()) return uniqueHosts([GATEWAY_HOST, DIRECT_HOST]);
+  if(location.protocol === "https:") return uniqueHosts([GATEWAY_HOST]);
+  return uniqueHosts([DIRECT_HOST, GATEWAY_HOST]);
+}
+let ACTIVE_HOST = gatewayHosts()[0];
+let API_BASE = `${ACTIVE_HOST}/player_api.php?username=${XTREAM.user}&password=${XTREAM.pass}`;
+let STREAM_BASE = ACTIVE_HOST;
+function activateHost(host){
+  ACTIVE_HOST = host;
+  API_BASE = `${ACTIVE_HOST}/player_api.php?username=${XTREAM.user}&password=${XTREAM.pass}`;
+  STREAM_BASE = ACTIVE_HOST;
+}
+function streamUrl(kind, streamId, ext){
+  const path = kind === 'live' ? 'live' : kind === 'series' ? 'series' : 'movie';
+  const suffix = kind === 'live' ? 'm3u8' : (ext || 'mp4');
+  return `${STREAM_BASE}/${path}/${XTREAM.user}/${XTREAM.pass}/${streamId}.${suffix}`;
+}
+function streamUrlForHost(host, kind, streamId, ext){
+  const path = kind === 'live' ? 'live' : kind === 'series' ? 'series' : 'movie';
+  const suffix = kind === 'live' ? 'm3u8' : (ext || 'mp4');
+  return `${host}/${path}/${XTREAM.user}/${XTREAM.pass}/${streamId}.${suffix}`;
+}
+function isMixedHttp(url){
+  return location.protocol === 'https:' && /^http:\/\//i.test(url);
+}
+function playbackCandidates(item, fallbackUrl){
+  const candidates = [];
+  const kind = item.kind === 'series' ? 'series' : item.kind;
+  if(item.streamId){
+    gatewayHosts().forEach(host => candidates.push(streamUrlForHost(host, kind, item.streamId, item.ext)));
+  }
+  if(fallbackUrl) candidates.unshift(fallbackUrl);
+  return uniqueHosts(candidates).filter(url => !isMixedHttp(url));
+}
+function apiUrlForHost(host, url){
+  const base = `${host}/player_api.php?username=${encodeURIComponent(XTREAM.user)}&password=${encodeURIComponent(XTREAM.pass)}`;
+  try{
+    const parsed = new URL(url, location.href);
+    const extra = [];
+    parsed.searchParams.forEach((value, key)=>{
+      if(key !== 'username' && key !== 'password') extra.push(`${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
+    });
+    return extra.length ? `${base}&${extra.join('&')}` : base;
+  }catch(e){
+    const query = (url.split('?')[1] || '').split('&')
+      .filter(part => part && !/^username=/i.test(part) && !/^password=/i.test(part))
+      .join('&');
+    return query ? `${base}&${query}` : base;
+  }
+}
 
 const PROXIES = [
   u => "https://corsproxy.io/?url=" + encodeURIComponent(u),
@@ -568,31 +628,36 @@ function proxify(u){ return PROXIES[0](u); }
 
 async function fetchJSON(url){
   const errors = [];
-  
-  // FIX 1: Direct Fetch handling with native .json() for memory management.
-  try{
-    const ctrl = new AbortController();
-    const to = setTimeout(()=>ctrl.abort(), 15000); // 15 seconds for direct
-    const r = await fetch(url, {signal: ctrl.signal});
-    clearTimeout(to);
-    if(r.ok){
-      return await r.json(); 
-    } else errors.push('direct '+r.status);
-  }catch(e){ errors.push('direct '+String(e).slice(0,30)); }
-  
-  // FIX 2: Proxy handling with 60-second timeouts to support 50MB VOD arrays.
+  const candidates = url.includes('/player_api.php?') ? gatewayHosts().map(host => apiUrlForHost(host, url)) : [url];
+  for (const candidate of candidates){
+    try{
+      const ctrl = new AbortController();
+      const to = setTimeout(()=>ctrl.abort(), 15000);
+      const r = await fetch(candidate, {signal: ctrl.signal});
+      clearTimeout(to);
+      if(r.ok){
+        const data = await r.json();
+        if(Array.isArray(data) ? data.length : data && Object.keys(data).length && !data.error){
+          const host = candidate.split('/player_api.php')[0];
+          activateHost(host);
+          return data;
+        }
+        errors.push(data && data.error ? data.error : 'empty');
+      } else errors.push('direct '+r.status);
+    }catch(e){ errors.push('direct '+String(e).slice(0,30)); }
+  }
+
   for (const p of PROXIES){
     try{
       const proxyUrl = p(url);
       const ctrl = new AbortController();
-      // Increased timeout to 60000ms. Massive Xtream JSON data needs time via Proxy over Mobile.
       const to = setTimeout(()=>ctrl.abort(), 60000);
       const r = await fetch(proxyUrl, {signal: ctrl.signal});
       clearTimeout(to);
       if(!r.ok){ errors.push('proxy '+r.status); continue; }
-      
-      // FIX 3: Using native r.json() instead of JSON.parse(await r.text()) to prevent WebView RAM crashes.
-      return await r.json(); 
+      const data = await r.json();
+      if(data && !data.error) return data;
+      errors.push(data && data.error ? data.error : 'empty');
     }catch(e){ errors.push(String(e).slice(0,40)); }
   }
   throw new Error('Network failure ('+errors.join(', ')+')');
@@ -605,6 +670,9 @@ let CATS = { movies: [], series: [], live: [] };
 
 let activeCat = { movies: 'All', series: 'All', live: 'All' };
 let hls = null;
+let playbackStartupTimer = null;
+let playbackAttemptToken = 0;
+let playbackCleanupFns = [];
 let CAT_MAP = { live:{}, vod:{}, series:{} }; 
 let SERIES_INFO_CACHE = {};
 let currentSeriesEpisodes = []; 
@@ -723,7 +791,7 @@ async function loadAll(){
     items.push({
       id: id++, kind:'live', name: s.name, logo: s.stream_icon||'',
       group: group,
-      url: `${STREAM_BASE}/live/${XTREAM.user}/${XTREAM.pass}/${s.stream_id}.m3u8`,
+      url: streamUrl('live', s.stream_id),
       streamId: s.stream_id,
     });
   });
@@ -733,7 +801,7 @@ async function loadAll(){
     items.push({
       id: id++, kind:'movie', name: s.name, logo: s.stream_icon||'',
       group: CAT_MAP.vod[s.category_id] || 'Movies',
-      url: `${STREAM_BASE}/movie/${XTREAM.user}/${XTREAM.pass}/${s.stream_id}.${ext}`,
+      url: streamUrl('movie', s.stream_id, ext),
       streamId: s.stream_id, ext,
       rating: s.rating, year: s.year, plot: s.plot,
     });
@@ -762,7 +830,7 @@ async function resolveSeriesFirstEpisode(item){
   const ep = eps[firstSeason] && eps[firstSeason][0];
   if(!ep) return '';
   const ext = ep.container_extension || 'mp4';
-  return `${STREAM_BASE}/series/${XTREAM.user}/${XTREAM.pass}/${ep.id}.${ext}`;
+  return streamUrl('series', ep.id, ext);
 }
 
 /* ====================== INIT ====================== */
@@ -1175,7 +1243,9 @@ function renderEpisodeList(season){
   currentSeriesEpisodes = list.map(ep => {
     const ext = ep.container_extension || 'mp4';
     return {
-      url: `${STREAM_BASE}/series/${XTREAM.user}/${XTREAM.pass}/${ep.id}.${ext}`,
+      url: streamUrl('series', ep.id, ext),
+      streamId: ep.id,
+      ext,
       title: ep.title || ep.info?.name || `Episode ${ep.episode_num}`,
       img: (ep.info && (ep.info.movie_image||ep.info.cover_big)) || ctx.item.logo || '',
       plot: (ep.info && ep.info.plot) ? ep.info.plot : '',
@@ -1285,16 +1355,58 @@ async function playItem(id){
     catch(e){ showToast('Could not load episode'); playerEl.classList.remove('loading'); return; }
   }
   if(!url){ showToast('No stream URL'); playerEl.classList.remove('loading'); return; }
+  const sources = playbackCandidates(item, url);
+  if(!sources.length){ showToast('No playable stream URL'); playerEl.classList.remove('loading'); return; }
 
   currentResumeKey = 'jf_resume_' + (item.kind==='series' ? ('series_'+(item.seriesId||id)+'_'+simpleHash(url)) : id);
   const saved = parseFloat(localStorage.getItem(currentResumeKey)||'0');
+  const attemptToken = ++playbackAttemptToken;
 
   const startWhenReady = ()=>{
+    if(attemptToken !== playbackAttemptToken) return;
     if(item.kind !== 'live' && saved>5 && isFinite(video.duration) && saved < video.duration-8) video.currentTime = saved;
-    video.play().then(()=>showControls(false)).catch(()=>showControls(true));
+    video.play()
+      .then(()=>showControls(false))
+      .catch(()=>{ playerEl.classList.remove('loading'); showControls(true); });
   };
+  let sourceIndex = 0;
+  let recoveries = 0;
+  const clearStartupTimer = ()=>{
+    if(playbackStartupTimer){ clearTimeout(playbackStartupTimer); playbackStartupTimer = null; }
+  };
+  const addOnce = (target, event, fn)=>{
+    const wrapped = (...args)=>{
+      if(attemptToken !== playbackAttemptToken) return;
+      fn(...args);
+    };
+    target.addEventListener(event, wrapped, {once:true});
+    playbackCleanupFns.push(()=>target.removeEventListener(event, wrapped));
+  };
+  const showStreamError = ()=>{
+    if(attemptToken !== playbackAttemptToken) return;
+    clearStartupTimer();
+    showToast('Stream error');
+    playerEl.classList.remove('loading');
+  };
+  const tryNextSource = ()=>{
+    if(attemptToken !== playbackAttemptToken) return;
+    clearStartupTimer();
+    if(sourceIndex < sources.length - 1) loadSourceAt(sourceIndex + 1);
+    else showStreamError();
+  };
+  const loadSourceAt = (index)=>{
+    if(attemptToken !== playbackAttemptToken) return;
+    clearStartupTimer();
+    sourceIndex = index;
+    const source = sources[sourceIndex];
+    if(!source){ showStreamError(); return; }
+    recoveries = 0;
+    destroyHls(true);
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
 
-  if(url.endsWith('.m3u8') || url.includes('.m3u8?')){
+  if(source.endsWith('.m3u8') || source.includes('.m3u8?')){
     if(window.Hls && Hls.isSupported()){
       hls = new Hls({
         autoStartLoad: true,
@@ -1306,30 +1418,54 @@ async function playItem(id){
         renderTextTracksNatively: true,
         enableWebVTT: true,
       });
-      hls.loadSource(url);
       hls.attachMedia(video);
+      playbackStartupTimer = setTimeout(tryNextSource, 18000);
+      hls.on(Hls.Events.MEDIA_ATTACHED, ()=>{
+        if(attemptToken !== playbackAttemptToken) return;
+        hls.loadSource(source);
+      });
       hls.on(Hls.Events.MANIFEST_PARSED, ()=>{
+        if(attemptToken !== playbackAttemptToken) return;
+        clearStartupTimer();
         availableQualities = hls.levels || [];
-        document.getElementById('qualityBtn').style.display = 'flex';
+        document.getElementById('qualityBtn').style.display = availableQualities.length>1?'flex':'none';
         startWhenReady();
       });
       hls.on(Hls.Events.ERROR, (_,d)=>{
+        if(attemptToken !== playbackAttemptToken) return;
         if(!d || !d.fatal) return;
-        if(d.type === Hls.ErrorTypes.NETWORK_ERROR){ try{ hls.startLoad(); }catch(e){} }
-        else if(d.type === Hls.ErrorTypes.MEDIA_ERROR){ try{ hls.recoverMediaError(); }catch(e){} }
-        else { showToast('Stream error'); playerEl.classList.remove('loading'); }
+        if(d.type === Hls.ErrorTypes.NETWORK_ERROR && recoveries < 1){ recoveries++; try{ hls.startLoad(); }catch(e){} }
+        else if(d.type === Hls.ErrorTypes.MEDIA_ERROR && recoveries < 1){ recoveries++; try{ hls.recoverMediaError(); }catch(e){} }
+        else tryNextSource();
       });
     } else if(video.canPlayType('application/vnd.apple.mpegurl')){
-      video.src = url;
-      video.addEventListener('loadedmetadata', startWhenReady, {once:true});
+      video.src = source;
+      video.load();
+      playbackStartupTimer = setTimeout(tryNextSource, 18000);
+      addOnce(video, 'loadedmetadata', ()=>{ clearStartupTimer(); startWhenReady(); });
+      addOnce(video, 'canplay', ()=>{ clearStartupTimer(); startWhenReady(); });
+      addOnce(video, 'error', tryNextSource);
+    } else {
+      tryNextSource();
     }
   } else {
-    video.src = url;
-    video.addEventListener('loadedmetadata', startWhenReady, {once:true});
-    document.getElementById('qualityBtn').style.display='flex';
+    video.src = source;
+    video.load();
+    playbackStartupTimer = setTimeout(tryNextSource, 18000);
+    addOnce(video, 'loadedmetadata', ()=>{ clearStartupTimer(); startWhenReady(); });
+    addOnce(video, 'canplay', ()=>{ clearStartupTimer(); startWhenReady(); });
+    addOnce(video, 'error', tryNextSource);
+    document.getElementById('qualityBtn').style.display='none';
   }
+  };
+  loadSourceAt(0);
 }
-function destroyHls(){ if(hls){try{hls.destroy()}catch(e){} hls=null;} }
+function destroyHls(keepAttemptToken=false){
+  if(!keepAttemptToken) playbackAttemptToken++;
+  if(playbackStartupTimer){ clearTimeout(playbackStartupTimer); playbackStartupTimer = null; }
+  playbackCleanupFns.splice(0).forEach(fn=>{try{fn()}catch(e){}});
+  if(hls){try{hls.destroy()}catch(e){} hls=null;}
+}
 function saveResume(){
   const item = ALL[currentItemId];
   if(item && item.kind!=='live' && currentItemId!==null && currentResumeKey && isFinite(video.duration) && video.duration>0 && video.currentTime>5 && video.currentTime < video.duration-10){
